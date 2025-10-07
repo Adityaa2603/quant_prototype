@@ -11,14 +11,11 @@ def int8_forward(
     zero_points: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    # Cast int8/uint8 weights to input's dtype for computation
     casted_weights = weight.to(input.dtype)
 
-    # Handle asymmetric zero_point if provided
     if zero_points is not None:
         casted_weights = casted_weights - zero_points
 
-    # Linear transformation followed by scaling
     output = F.linear(input, casted_weights) * scales
 
     if bias is not None:
@@ -41,15 +38,9 @@ class QuantizedLinear(torch.nn.Module):
         self.bias = bias
         self.dtype = dtype
 
-        # Separate buffers for symmetric (int8) and asymmetric (uint8) weights
-        self.register_buffer(
-            "int8_weights",
-            torch.randint(-128, 127, (output_features, input_features), dtype=torch.int8),
-        )
-        self.register_buffer(
-            "uint8_weights",
-            torch.zeros((output_features, input_features), dtype=torch.uint8),
-        )
+        # Weight buffers are initialized as None and created during quantization
+        self.int8_weights: torch.Tensor | None = None
+        self.uint8_weights: torch.Tensor | None = None
 
         self.register_buffer("scales", torch.randn((output_features), dtype=dtype))
         self.register_buffer("zero_points", torch.zeros((output_features), dtype=dtype))
@@ -92,18 +83,20 @@ class QuantizedLinear(torch.nn.Module):
             int_weights = (
                 torch.round(weights / scales_tensor).clamp(qmin, qmax).to(torch.int8)
             )
-            self.int8_weights.copy_(int_weights)
+            self.int8_weights = int_weights
+            self.uint8_weights = None
         elif mapping_type == MappingEnum.ASYMMETRIC:
             uint_weights = (
                 torch.round((weights / scales_tensor) + zero_points_tensor)
                 .clamp(qmin, qmax)
                 .to(torch.uint8)
             )
-            self.uint8_weights.copy_(uint_weights)
+            self.uint8_weights = uint_weights
+            self.int8_weights = None
 
         self.scales.copy_(scales_tensor)
         self.zero_points.copy_(zero_points_tensor)
 
     def forward(self, input):
-        weight = self.int8_weights if self.int8_weights.sum() != 0 else self.uint8_weights
+        weight = self.int8_weights if self.int8_weights is not None else self.uint8_weights
         return int8_forward(weight, input, self.scales, self.zero_points, self.bias)
