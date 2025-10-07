@@ -8,23 +8,16 @@ def int8_forward(
     weight: torch.Tensor,
     input: torch.Tensor,
     scales: torch.Tensor,
+    zero_points: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """
-    Performs a forward pass for a quantized linear layer using int8 weights.
-
-    Args:
-        weight (torch.Tensor): Quantized weight tensor of shape (output_featuresures, input_featuresures), dtype int8.
-        input (torch.Tensor): Input tensor of shape (batch_size, input_featuresures), typically float32 or float16.
-        scales (torch.Tensor): Scale tensor of shape (output_featuresures,) used to dequantize the weights.
-        bias (torch.Tensor | None, optional): Optional bias tensor of shape (1, output_featuresures). Defaults to None.
-
-    Returns:
-        torch.Tensor: Output tensor of shape (batch_size, output_featuresures) after applying the linear transformation
-                      and scaling. Same dtype as `input`.
-    """
-    # Cast int8 weights to input's dtype for computation
+    # Cast int8/uint8 weights to input's dtype for computation
     casted_weights = weight.to(input.dtype)
+
+    # Handle asymmetric zero_point if provided
+    if zero_points is not None:
+        casted_weights = casted_weights - zero_points
+
     # Linear transformation followed by scaling
     output = F.linear(input, casted_weights) * scales
 
@@ -35,20 +28,6 @@ def int8_forward(
 
 
 class QuantizedLinear(torch.nn.Module):
-    """
-    A linear layer module with quantized int8 weights.
-
-    Attributes:
-        input_features (int): Number of input features.
-        output_features (int): Number of output features.
-        bias (bool): Whether to include a bias term.
-        dtype (torch.dtype): Data type for bias and computation.
-        int8_weights (torch.Tensor): Stored int8 weight tensor.
-        scales (torch.Tensor | None): Scale tensor for dequantizing weights.
-        zero_points (torch.Tensor | None): Zero-point tensor (for asymmetric quantization, currently unused).
-        bias (torch.Tensor | None): Bias tensor if bias=True, else None.
-    """
-
     def __init__(
         self,
         input_features: int,
@@ -56,33 +35,19 @@ class QuantizedLinear(torch.nn.Module):
         bias: bool = True,
         dtype: torch.dtype = torch.float32,
     ):
-        """
-        Initializes a QuantizedLinear layer.
-
-        Args:
-            input_features (int): Number of input features.
-            output_features (int): Number of output features.
-            bias (bool, optional): If True, adds a learnable bias to the output. Defaults to True.
-            dtype (torch.dtype, optional): Data type for bias and computation. Defaults to torch.float32.
-        """
         super().__init__()
         self.input_features = input_features
         self.output_features = output_features
         self.bias = bias
         self.dtype = dtype
 
-        # Initialize int8 weights randomly
         self.register_buffer(
             "int8_weights",
             torch.randint(-128, 127, (output_features, input_features), dtype=torch.int8),
         )
-
-        # Scale and zero-point buffers for quantization
         self.register_buffer("scales", torch.randn((output_features), dtype=dtype))
-        self.register_buffer("zero_points", torch.randn((1, output_features), 
-                                             dtype=dtype))
+        self.register_buffer("zero_points", torch.zeros((output_features), dtype=dtype))
 
-        # Optional bias
         if bias:
             self.register_buffer("bias", torch.randn((1, output_features), dtype=dtype))
         else:
@@ -94,34 +59,6 @@ class QuantizedLinear(torch.nn.Module):
         granularity: GranularityEnum = GranularityEnum.PER_ROW,
         mapping_type: MappingEnum = MappingEnum.SYMMETRIC,
     ):
-        """
-        Quantizes a given weight tensor into int8 format based on the specified granularity
-        and mapping type. Computes scale and zero-point tensors, then performs quantization.
-
-        Args:
-            self: The object that stores quantized weights and parameters.
-            weights (torch.Tensor): The input weight tensor to be quantized.
-            granularity (Granularity, optional): Determines the quantization resolution.
-                - Granularity.PER_TENSOR → Single scale/zero-point for entire tensor.
-                - Granularity.PER_ROW → Separate scale/zero-point for each row.
-                Default is Granularity.PER_ROW.
-            mapping_type (MappingType, optional): Defines quantization mapping behavior.
-                - MappingType.SYMMETRIC → Values are centered around zero ([-128, 127]).
-                - MappingType.ASYMMETRIC → Values shifted to positive range ([0, 255]).
-                Default is MappingType.SYMMETRIC.
-
-        Returns:
-            None.
-            Stores the following attributes in `self`:
-                - self.int8_weights (torch.Tensor): Quantized int8/uint8 weight tensor.
-                - self.scales (torch.Tensor): Scale tensor used for quantization.
-                - self.zero_points (torch.Tensor): Zero-point tensor used for quantization.
-
-        Raises:
-            ValueError: If `weights` is None, or if an unsupported granularity or mapping type is provided.
-
-        """
-
         if weights is None:
             raise ValueError("Expected weights tensor for quantization.")
 
@@ -138,32 +75,27 @@ class QuantizedLinear(torch.nn.Module):
 
         if granularity == GranularityEnum.PER_ROW:
             scales_tensor = torch.tensor(scales_list, dtype=torch.float32).unsqueeze(1)
-            zero_points_tensor = torch.tensor(
-                zero_points_list, dtype=torch.float32
-            ).unsqueeze(1)
-
+            zero_points_tensor = torch.tensor(zero_points_list, dtype=torch.float32).unsqueeze(1)
         elif granularity == GranularityEnum.PER_TENSOR:
             scales_tensor = torch.tensor(scales_list[0], dtype=torch.float32)
             zero_points_tensor = torch.tensor(zero_points_list[0], dtype=torch.float32)
-
         else:
             raise ValueError(f"Unsupported granularity: {granularity}")
 
         if mapping_type == MappingEnum.SYMMETRIC:
-            int8_weights = (
+            int_weights = (
                 torch.round(weights / scales_tensor).clamp(qmin, qmax).to(torch.int8)
             )
         elif mapping_type == MappingEnum.ASYMMETRIC:
-            int8_weights = (
+            int_weights = (
                 torch.round((weights / scales_tensor) + zero_points_tensor)
                 .clamp(qmin, qmax)
                 .to(torch.uint8)
             )
 
-        self.int8_weights.copy_(int8_weights)
+        self.int8_weights.copy_(int_weights)
         self.scales.copy_(scales_tensor)
         self.zero_points.copy_(zero_points_tensor)
 
-
     def forward(self, input):
-        return int8_forward(self.int8_weights, input, self.scales, self.bias)
+        return int8_forward(self.int8_weights, input, self.scales, self.zero_points, self.bias)
