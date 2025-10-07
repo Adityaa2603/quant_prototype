@@ -38,11 +38,14 @@ class QuantizedLinear(torch.nn.Module):
         self.bias = bias
         self.dtype = dtype
 
-        # Weight buffers are initialized as None and created during quantization
-        self.int8_weights: torch.Tensor | None = None
-        self.uint8_weights: torch.Tensor | None = None
+        # Pre-register empty buffers
+        self.register_buffer("int8_weights", torch.empty((output_features, input_features), dtype=torch.int8))
+        self.register_buffer("uint8_weights", torch.empty((output_features, input_features), dtype=torch.uint8))
 
-        self.register_buffer("scales", torch.randn((output_features), dtype=dtype))
+        # Track which type is active
+        self.is_symmetric: bool | None = None
+
+        self.register_buffer("scales", torch.ones((output_features), dtype=dtype))
         self.register_buffer("zero_points", torch.zeros((output_features), dtype=dtype))
 
         if bias:
@@ -80,23 +83,22 @@ class QuantizedLinear(torch.nn.Module):
             raise ValueError(f"Unsupported granularity: {granularity}")
 
         if mapping_type == MappingEnum.SYMMETRIC:
-            int_weights = (
-                torch.round(weights / scales_tensor).clamp(qmin, qmax).to(torch.int8)
-            )
-            self.int8_weights = int_weights
-            self.uint8_weights = None
+            int_weights = torch.round(weights / scales_tensor).clamp(qmin, qmax).to(torch.int8)
+            self.int8_weights.copy_(int_weights)
+            self.is_symmetric = True
         elif mapping_type == MappingEnum.ASYMMETRIC:
-            uint_weights = (
-                torch.round((weights / scales_tensor) + zero_points_tensor)
-                .clamp(qmin, qmax)
-                .to(torch.uint8)
-            )
-            self.uint8_weights = uint_weights
-            self.int8_weights = None
+            uint_weights = torch.round((weights / scales_tensor) + zero_points_tensor).clamp(qmin, qmax).to(torch.uint8)
+            self.uint8_weights.copy_(uint_weights)
+            self.is_symmetric = False
 
         self.scales.copy_(scales_tensor)
         self.zero_points.copy_(zero_points_tensor)
 
     def forward(self, input):
-        weight = self.int8_weights if self.int8_weights is not None else self.uint8_weights
-        return int8_forward(weight, input, self.scales, self.zero_points, self.bias)
+        if self.is_symmetric is None:
+            raise RuntimeError("Weights are not quantized yet. Call `quantize()` first.")
+
+        weight = self.int8_weights if self.is_symmetric else self.uint8_weights
+        zero_points = self.zero_points if not self.is_symmetric else None
+
+        return int8_forward(weight, input, self.scales, zero_points, self.bias)
