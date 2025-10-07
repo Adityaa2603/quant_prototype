@@ -41,10 +41,16 @@ class QuantizedLinear(torch.nn.Module):
         self.bias = bias
         self.dtype = dtype
 
+        # Separate buffers for symmetric (int8) and asymmetric (uint8) weights
         self.register_buffer(
             "int8_weights",
             torch.randint(-128, 127, (output_features, input_features), dtype=torch.int8),
         )
+        self.register_buffer(
+            "uint8_weights",
+            torch.zeros((output_features, input_features), dtype=torch.uint8),
+        )
+
         self.register_buffer("scales", torch.randn((output_features), dtype=dtype))
         self.register_buffer("zero_points", torch.zeros((output_features), dtype=dtype))
 
@@ -86,16 +92,18 @@ class QuantizedLinear(torch.nn.Module):
             int_weights = (
                 torch.round(weights / scales_tensor).clamp(qmin, qmax).to(torch.int8)
             )
+            self.int8_weights.copy_(int_weights)
         elif mapping_type == MappingEnum.ASYMMETRIC:
-            int_weights = (
+            uint_weights = (
                 torch.round((weights / scales_tensor) + zero_points_tensor)
                 .clamp(qmin, qmax)
                 .to(torch.uint8)
             )
+            self.uint8_weights.copy_(uint_weights)
 
-        self.int8_weights.copy_(int_weights)
         self.scales.copy_(scales_tensor)
         self.zero_points.copy_(zero_points_tensor)
 
     def forward(self, input):
-        return int8_forward(self.int8_weights, input, self.scales, self.zero_points, self.bias)
+        weight = self.int8_weights if self.int8_weights.sum() != 0 else self.uint8_weights
+        return int8_forward(weight, input, self.scales, self.zero_points, self.bias)
