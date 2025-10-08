@@ -27,20 +27,24 @@ def compute_qparams(
 
     # degenerate case: all values identical -> avoid division by zero
     if abs(x_max - x_min) < eps:
-        # set small non-zero scale to avoid div-by-zero; zero_point choose mid of q range
-        scale = 1.0
-        zero_point = int((qmin + qmax) // 2)
-        return scale, zero_point
+        if mapping_type == MappingEnum.SYMMETRIC:
+            return 1.0, 0
+        else:  # asymmetric
+            scale = 1.0
+            zp = qmin - round(x_min / scale)
+            zp = int(min(max(zp, qmin), qmax))
+            return scale, zp
 
     if mapping_type == MappingEnum.SYMMETRIC:
         max_abs = max(abs(x_min), abs(x_max))
         qmax_abs = max(abs(qmin), abs(qmax))
-        scale = max_abs / (qmax_abs + eps)
+        scale = max_abs / qmax_abs
         zero_point = 0
 
     elif mapping_type == MappingEnum.ASYMMETRIC:
-        scale = (x_max - x_min) / (qmax - qmin + eps)
-        zero_point = int(min(max(round(x_min / scale), qmin), qmax))
+        scale = (x_max - x_min) / (qmax - qmin)
+        zero_point = qmin - round(x_min / scale)
+        zero_point = int(min(max(zero_point, qmin), qmax))
 
     else:
         raise ValueError(f"Unsupported mapping type: {mapping_type}")
